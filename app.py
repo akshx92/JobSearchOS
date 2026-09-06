@@ -151,10 +151,10 @@ def import_mba_excel(file_path):
             company_id = existing[0]
         else:
             cur.execute(
-                "INSERT INTO companies (original_name, normalized_name) VALUES (%s, %s)",
+                "INSERT INTO companies (original_name, normalized_name) VALUES (%s, %s) RETURNING id",
                 (company_original, company_normalized),
             )
-            company_id = cur.lastrowid
+            company_id = cur.fetchone()[0]
             new_companies += 1
 
         contact_name = str(row.get(col_name, "") or "")
