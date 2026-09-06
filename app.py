@@ -1,18 +1,18 @@
-import os
 import re
 import datetime
 import threading
-import psycopg2
-from psycopg2.extras import execute_values
-import sqlite3
 import pandas as pd
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import search_engine
+from db_utils import get_connection, is_postgres, q
+
+try:
+    from psycopg2.extras import execute_values
+except ImportError:
+    execute_values = None
 
 st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
-
-DB_FILE = "job_search_os.db"
 
 # ---------------------------------------------------------------------------
 # STYLING
@@ -34,18 +34,6 @@ st.markdown("""
     .block-container { padding-top: 1.5rem !important; max-width: 1400px; }
 </style>
 """, unsafe_allow_html=True)
-
-
-def get_connection():
-    db_url = None
-    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
-        db_url = st.secrets["DATABASE_URL"]
-    else:
-        db_url = os.getenv("DATABASE_URL")
-
-    if db_url:
-        return psycopg2.connect(db_url)
-    return sqlite3.connect(DB_FILE, timeout=15)
 
 
 def clean(val):
@@ -85,7 +73,7 @@ def tier_breakdown_str(comp_jobs):
 def get_setting(key, default=""):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
+    cur.execute(q("SELECT value FROM settings WHERE key = ?"), (key,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else default
@@ -95,8 +83,8 @@ def set_setting(key, value):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settings (key, value) VALUES (%s, %s) "
-        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        q("INSERT INTO settings (key, value) VALUES (?, ?) "
+          "ON CONFLICT(key) DO UPDATE SET value = excluded.value"),
         (key, value),
     )
     conn.commit()
@@ -210,16 +198,29 @@ def import_mba_excel(file_path):
     new_companies_count = len(new_companies_dict)
     if new_companies_dict:
         comp_tuples = [(orig, norm) for norm, orig in new_companies_dict.items()]
-        insert_comp_sql = """
-            INSERT INTO companies (original_name, normalized_name)
-            VALUES %s
-            ON CONFLICT (normalized_name) DO NOTHING
-            RETURNING normalized_name, id
-        """
-        returned = execute_values(cur, insert_comp_sql, comp_tuples, fetch=True, page_size=500)
-        if returned:
-            for norm, c_id in returned:
-                company_map[norm] = c_id
+        if is_postgres():
+            insert_comp_sql = """
+                INSERT INTO companies (original_name, normalized_name)
+                VALUES %s
+                ON CONFLICT (normalized_name) DO NOTHING
+                RETURNING normalized_name, id
+            """
+            returned = execute_values(cur, insert_comp_sql, comp_tuples, fetch=True, page_size=500)
+            if returned:
+                for norm, c_id in returned:
+                    company_map[norm] = c_id
+        else:
+            # Local SQLite fallback — no execute_values available, so a plain
+            # per-row loop instead. Fine for local dev volumes.
+            for orig, norm in comp_tuples:
+                cur.execute(
+                    "INSERT OR IGNORE INTO companies (original_name, normalized_name) VALUES (?, ?)",
+                    (orig, norm),
+                )
+                cur.execute("SELECT id FROM companies WHERE normalized_name = ?", (norm,))
+                row = cur.fetchone()
+                if row:
+                    company_map[norm] = row[0]
 
     # 4. Bulk insert contacts
     contacts_to_insert = []
@@ -230,11 +231,17 @@ def import_mba_excel(file_path):
 
     total_contacts = len(contacts_to_insert)
     if contacts_to_insert:
-        insert_contacts_sql = """
-            INSERT INTO contacts (company_id, contact_name, phone, email, mba_college)
-            VALUES %s
-        """
-        execute_values(cur, insert_contacts_sql, contacts_to_insert, page_size=1000)
+        if is_postgres():
+            insert_contacts_sql = """
+                INSERT INTO contacts (company_id, contact_name, phone, email, mba_college)
+                VALUES %s
+            """
+            execute_values(cur, insert_contacts_sql, contacts_to_insert, page_size=1000)
+        else:
+            cur.executemany(
+                "INSERT INTO contacts (company_id, contact_name, phone, email, mba_college) VALUES (?, ?, ?, ?, ?)",
+                contacts_to_insert,
+            )
 
     conn.commit()
     conn.close()
@@ -427,7 +434,7 @@ if file_type == "CV":
         cur = conn.cursor()
         cur.execute("UPDATE cv_versions SET is_active = FALSE")
         cur.execute(
-            "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (%s, %s, TRUE)",
+            q("INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (?, ?, TRUE)"),
             (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         conn.commit()
@@ -509,7 +516,7 @@ st.markdown("---")
 def get_contacts_df(company_id):
     conn = get_connection()
     contacts = pd.read_sql_query(
-        "SELECT contact_name, phone, email, mba_college FROM contacts WHERE company_id = %s",
+        q("SELECT contact_name, phone, email, mba_college FROM contacts WHERE company_id = ?"),
         conn, params=(company_id,)
     )
     conn.close()
@@ -556,7 +563,7 @@ def render_contact_and_outreach(job_id, company_id, job_title, company_name, key
 def update_job_status(job_row_id, new_status):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE jobs SET job_status = %s WHERE id = %s", (new_status, job_row_id))
+    cur.execute(q("UPDATE jobs SET job_status = ? WHERE id = ?"), (new_status, job_row_id))
     conn.commit()
     conn.close()
 

@@ -1,4 +1,3 @@
-import sqlite3
 import datetime
 import time
 import re
@@ -6,8 +5,8 @@ import logging
 from jobdrop import scrape_jobs
 import pandas as pd
 from ai_evaluator import evaluate_job_match, load_cv
+from db_utils import get_connection, q, insert_and_get_id, is_postgres
 
-DB_FILE = "job_search_os.db"
 TARGET_ROLES = (
     "Project Manager OR Program Manager OR Programme Manager OR "
     "Technical Project Manager OR Technical Program Manager OR Scrum Master OR "
@@ -89,8 +88,8 @@ def resolve_company_alias(normalized_name):
 
 def _log_error(cursor, company_id, run_id, error_type, message):
     cursor.execute(
-        """INSERT INTO error_log (company_id, run_id, timestamp, error_type, error_message)
-           VALUES (?, ?, ?, ?, ?)""",
+        q("""INSERT INTO error_log (company_id, run_id, timestamp, error_type, error_message)
+           VALUES (?, ?, ?, ?, ?)"""),
         (company_id, run_id, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
          error_type, str(message)[:500]),
     )
@@ -193,28 +192,28 @@ def _get_companies(cursor, mode, limit):
 
     if mode == "retry_errors":
         cursor.execute(
-            f"""SELECT id, original_name FROM companies
+            q(f"""SELECT id, original_name FROM companies
                 WHERE scan_status IN ('ERROR','INCOMPLETE')
-                ORDER BY {contact_priority} LIMIT ?""",
+                ORDER BY {contact_priority} LIMIT ?"""),
             (limit,),
         )
     elif mode == "new_run":
         cursor.execute(
-            f"SELECT id, original_name FROM companies ORDER BY {contact_priority} LIMIT ?",
+            q(f"SELECT id, original_name FROM companies ORDER BY {contact_priority} LIMIT ?"),
             (limit,),
         )
     elif mode == "freshness_check":
         cursor.execute(
-            f"""SELECT id, original_name FROM companies
+            q(f"""SELECT id, original_name FROM companies
                 WHERE last_scanned_date IS NOT NULL
-                ORDER BY {contact_priority} LIMIT ?""",
+                ORDER BY {contact_priority} LIMIT ?"""),
             (limit,),
         )
     else:  # next_batch
         cursor.execute(
-            f"""SELECT id, original_name FROM companies
+            q(f"""SELECT id, original_name FROM companies
                 WHERE scan_status = 'NOT_SCANNED'
-                ORDER BY {contact_priority} LIMIT ?""",
+                ORDER BY {contact_priority} LIMIT ?"""),
             (limit,),
         )
     return cursor.fetchall()
@@ -293,14 +292,14 @@ def verify_job_links(limit=30):
     so one bad request can't derail the batch."""
     import requests
 
-    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute(
-        """SELECT id, job_url FROM jobs
+        q("""SELECT id, job_url FROM jobs
            WHERE job_status NOT IN ('Rejected', 'Closed/Expired') AND job_url IS NOT NULL AND job_url != ''
            ORDER BY last_verified_date IS NOT NULL, last_verified_date ASC
-           LIMIT ?""",
+           LIMIT ?"""),
         (limit,),
     )
     rows = cursor.fetchall()
@@ -315,13 +314,13 @@ def verify_job_links(limit=30):
             checked += 1
             if resp.status_code in (404, 410):
                 cursor.execute(
-                    "UPDATE jobs SET job_status = 'Closed/Expired', link_verified = 0, last_verified_date = ? WHERE id = ?",
+                    q("UPDATE jobs SET job_status = 'Closed/Expired', link_verified = 0, last_verified_date = ? WHERE id = ?"),
                     (now, job_id),
                 )
                 expired += 1
             else:
                 cursor.execute(
-                    "UPDATE jobs SET link_verified = 1, last_verified_date = ? WHERE id = ?",
+                    q("UPDATE jobs SET link_verified = 1, last_verified_date = ? WHERE id = ?"),
                     (now, job_id),
                 )
             conn.commit()
@@ -361,7 +360,7 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                 from a background thread. Keys: running, current, total, message.
     stop_event: a threading.Event() the UI can set to request a graceful stop.
     """
-    conn = sqlite3.connect(DB_FILE, timeout=15)
+    conn = get_connection()
     cursor = conn.cursor()
 
     cursor.execute("UPDATE jobs SET job_status = 'Old' WHERE job_status = 'New'")
@@ -401,11 +400,11 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
         return msg
 
     start_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    cursor.execute(
+    run_id = insert_and_get_id(
+        cursor,
         "INSERT INTO search_runs (start_time, cv_version_id, companies_scanned) VALUES (?, ?, 0)",
         (start_time, cv_id),
     )
-    run_id = cursor.lastrowid
     conn.commit()
 
     companies_completed = 0
@@ -433,8 +432,8 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
             scan_state["message"] = f"Scanning ({i + 1}/{total_companies}): {comp_name}"
 
         cursor.execute(
-            """INSERT INTO scan_records (company_id, run_id, scan_date, status, cv_version_id)
-               VALUES (?, ?, ?, 'IN_PROGRESS', ?)""",
+            q("""INSERT INTO scan_records (company_id, run_id, scan_date, status, cv_version_id)
+               VALUES (?, ?, ?, 'IN_PROGRESS', ?)"""),
             (comp_id, run_id, scan_date, cv_id),
         )
         conn.commit()
@@ -493,7 +492,7 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                     cross_source_match_id = None
                     matched_source = None
                     cursor.execute(
-                        "SELECT id, job_title, source, job_status FROM jobs WHERE company_id = ? AND job_status NOT IN ('Rejected', 'Closed/Expired')",
+                        q("SELECT id, job_title, source, job_status FROM jobs WHERE company_id = ? AND job_status NOT IN ('Rejected', 'Closed/Expired')"),
                         (comp_id,),
                     )
                     for existing_id, existing_title, existing_source, existing_status in cursor.fetchall():
@@ -507,9 +506,9 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                         if source_label not in merged_source:
                             merged_source = f"{merged_source}, {source_label}" if merged_source else source_label
                         cursor.execute(
-                            """UPDATE jobs SET last_seen_date = ?, source = ?,
+                            q("""UPDATE jobs SET last_seen_date = ?, source = ?,
                                job_status = CASE WHEN job_status = 'Old' THEN 'New' ELSE job_status END
-                               WHERE id = ?""",
+                               WHERE id = ?"""),
                             (scan_date, merged_source, cross_source_match_id),
                         )
                         conn.commit()
@@ -519,14 +518,14 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                     # #1: Already have this exact posting? Don't re-evaluate it —
                     # just refresh last_seen_date and revive it from Old to New
                     # if needed. Same result as before, zero wasted AI calls.
-                    cursor.execute("SELECT id, job_status FROM jobs WHERE job_url = ?", (job_url,))
+                    cursor.execute(q("SELECT id, job_status FROM jobs WHERE job_url = ?"), (job_url,))
                     existing_job = cursor.fetchone()
                     if existing_job:
                         existing_id, existing_status = existing_job
                         cursor.execute(
-                            """UPDATE jobs SET last_seen_date = ?,
+                            q("""UPDATE jobs SET last_seen_date = ?,
                                job_status = CASE WHEN job_status = 'Old' THEN 'New' ELSE job_status END
-                               WHERE id = ?""",
+                               WHERE id = ?"""),
                             (scan_date, existing_id),
                         )
                         conn.commit()
@@ -576,13 +575,24 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
 
                     job_id_value = external_job_id if external_job_id else f"URLHASH-{abs(hash(job_url)) % (10 ** 10)}"
 
-                    cursor.execute(
-                        """INSERT OR IGNORE INTO jobs (
+                    if is_postgres():
+                        insert_sql = """INSERT INTO jobs (
                                job_id, company_id, run_id, job_title, location,
                                required_experience_min, required_experience_max, experience_text,
                                posting_date, posting_date_verified, date_discovered, last_seen_date,
                                job_url, source, match_score, match_rationale, job_status
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                           ON CONFLICT (job_url) DO NOTHING"""
+                    else:
+                        insert_sql = """INSERT OR IGNORE INTO jobs (
+                               job_id, company_id, run_id, job_title, location,
+                               required_experience_min, required_experience_max, experience_text,
+                               posting_date, posting_date_verified, date_discovered, last_seen_date,
+                               job_url, source, match_score, match_rationale, job_status
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"""
+
+                    cursor.execute(
+                        q(insert_sql),
                         (
                             job_id_value, comp_id, run_id, job_title, location,
                             exp_min, exp_max, experience_text,
@@ -597,22 +607,22 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                         # Update last_seen_date and revive it from Old back to New, but leave
                         # manually-set pipeline statuses (Applied, Interview, etc.) untouched.
                         cursor.execute(
-                            """UPDATE jobs SET last_seen_date = ?,
+                            q("""UPDATE jobs SET last_seen_date = ?,
                                job_status = CASE WHEN job_status = 'Old' THEN 'New' ELSE job_status END
-                               WHERE job_url = ?""",
+                               WHERE job_url = ?"""),
                             (scan_date, job_url),
                         )
                     conn.commit()
 
             final_status = "INCOMPLETE" if source_errors else "COMPLETED"
             cursor.execute(
-                "UPDATE scan_records SET status = ? WHERE company_id = ? AND run_id = ?",
+                q("UPDATE scan_records SET status = ? WHERE company_id = ? AND run_id = ?"),
                 (final_status, comp_id, run_id),
             )
             cursor.execute(
-                """UPDATE companies SET scan_status = ?,
+                q("""UPDATE companies SET scan_status = ?,
                    first_scanned_date = COALESCE(first_scanned_date, ?),
-                   last_scanned_date = ? WHERE id = ?""",
+                   last_scanned_date = ? WHERE id = ?"""),
                 (final_status, scan_date, scan_date, comp_id),
             )
             conn.commit()
@@ -621,18 +631,18 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
 
         except Exception as e:
             cursor.execute(
-                "UPDATE scan_records SET status = 'ERROR', error_reason = ? WHERE company_id = ? AND run_id = ?",
+                q("UPDATE scan_records SET status = 'ERROR', error_reason = ? WHERE company_id = ? AND run_id = ?"),
                 (str(e), comp_id, run_id),
             )
-            cursor.execute("UPDATE companies SET scan_status = 'ERROR' WHERE id = ?", (comp_id,))
+            cursor.execute(q("UPDATE companies SET scan_status = 'ERROR' WHERE id = ?"), (comp_id,))
             _log_error(cursor, comp_id, run_id, "SCRAPING_ERROR", str(e))
             conn.commit()
             errors_logged += 1
 
     end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     cursor.execute(
-        """UPDATE search_runs SET end_time = ?, companies_scanned = ?,
-           relevant_jobs_found = ?, errors = ? WHERE id = ?""",
+        q("""UPDATE search_runs SET end_time = ?, companies_scanned = ?,
+           relevant_jobs_found = ?, errors = ? WHERE id = ?"""),
         (end_time, companies_completed, jobs_found, errors_logged, run_id),
     )
     conn.commit()
