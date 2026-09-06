@@ -1,12 +1,14 @@
-import streamlit as st
+import os
+import re
+import datetime
+import threading
+import psycopg2
+from psycopg2.extras import execute_values
 import sqlite3
 import pandas as pd
-import threading
-import datetime
+import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import search_engine
-import os
-import psycopg2
 
 st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
 
@@ -35,7 +37,6 @@ st.markdown("""
 
 
 def get_connection():
-  # Read from Streamlit Secrets or local environment
     db_url = None
     if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
         db_url = st.secrets["DATABASE_URL"]
@@ -119,11 +120,9 @@ def build_outreach_message(user_name, contact_name, company_name, job_title, mba
     )
 
 
-import re
-import pandas as pd
-from psycopg2.extras import execute_values
-
-# Hoist noise cleaning patterns to module level to avoid recompiling in loops
+# ---------------------------------------------------------------------------
+# NORMALIZATION & MBA REFERRAL IMPORT
+# ---------------------------------------------------------------------------
 NOISE_RE = re.compile(
     r"\(.*?\)"
     r"|\bstill to join\b|\byet to join\b|\bto join\b|\bjoining soon\b|\bjoining shortly\b"
@@ -142,20 +141,40 @@ COMPANY_ALIASES = {
     "mckinsey": "mckinseycompany",
 }
 
+
 def _fast_clean_company(raw):
     text = NOISE_RE.sub("", str(raw or ""))
     text = re.split(r"\s+-\s+|\s*,\s*", text, maxsplit=1)[0]
     return re.sub(r"\s+", " ", text).strip(" -,:;")
+
 
 def _fast_normalize_company(name):
     cleaned = _fast_clean_company(name).lower()
     norm = re.sub(r"[^a-z0-9]", "", cleaned)
     return COMPANY_ALIASES.get(norm, norm)
 
+
 def import_mba_excel(file_path):
-    # Read only the necessary 4 columns to avoid parsing heavy unused sheet columns
-    target_cols = ["Current Company", "Your full name", "Whatsapp no.", "Your MBA college"]
-    df = pd.read_excel(file_path, usecols=lambda c: c in target_cols)
+    """Refreshes contacts from an updated MBA referral Excel file using
+    bulk operations and flexible header detection."""
+    df = pd.read_excel(file_path)
+
+    col_map = {str(c).strip().lower(): c for c in df.columns}
+
+    def find_col(candidates):
+        for candidate in candidates:
+            for clean_name, orig in col_map.items():
+                if candidate in clean_name:
+                    return orig
+        return None
+
+    col_company = find_col(["current company", "company", "organization"])
+    col_name = find_col(["your full name", "full name", "contact name", "name"])
+    col_phone = find_col(["whatsapp", "phone", "mobile", "contact no", "number"])
+    col_college = find_col(["mba college", "college", "institute", "b-school"])
+
+    if not col_company:
+        return 0, 0
 
     conn = get_connection()
     cur = conn.cursor()
@@ -170,11 +189,8 @@ def import_mba_excel(file_path):
     new_companies_dict = {}
     parsed_rows = []
 
-    for row in df.itertuples(index=False):
-        # Access attributes dynamically or by index
-        row_dict = row._asdict() if hasattr(row, "_asdict") else dict(zip(target_cols, row))
-        raw_company = row_dict.get("Current Company", "")
-        
+    for _, row in df.iterrows():
+        raw_company = row.get(col_company, "")
         orig_cleaned = _fast_clean_company(raw_company)
         if not orig_cleaned or orig_cleaned.lower() in PLACEHOLDERS or orig_cleaned.lower() == "nan":
             continue
@@ -185,9 +201,9 @@ def import_mba_excel(file_path):
 
         parsed_rows.append((
             norm,
-            str(row_dict.get("Your full name") or ""),
-            str(row_dict.get("Whatsapp no.") or ""),
-            str(row_dict.get("Your MBA college") or "")
+            str(row.get(col_name, "") or "") if col_name else "",
+            str(row.get(col_phone, "") or "") if col_phone else "",
+            str(row.get(col_college, "") or "") if col_college else ""
         ))
 
     # 3. Bulk insert new companies
@@ -225,7 +241,7 @@ def import_mba_excel(file_path):
     return new_companies_count, total_contacts
 
 
-@st.dialog("Replace all contacts from this file%s")
+@st.dialog("Replace all contacts from this file?")
 def confirm_mba_import_dialog(mba_path):
     st.write("This will completely replace your current contacts list with what's in the uploaded file.")
     st.write("Companies are only ever added to, never deleted — your scan history is safe.")
@@ -289,7 +305,7 @@ def reset_all_scan_data():
     conn.close()
 
 
-@st.dialog("Reset all scan data%s")
+@st.dialog("Reset all scan data?")
 def confirm_reset_dialog():
     st.write("This permanently deletes:")
     st.markdown("- All discovered jobs\n- All scan records and search run history\n- All logged errors\n- All saved jobs")
@@ -545,9 +561,6 @@ def update_job_status(job_row_id, new_status):
     conn.close()
 
 
-# Pipeline column definitions: which statuses fall into each column, and what
-# the "advance" button moves a job to next. Rejected is included as a
-# recovery stage — nothing is a one-way door.
 PIPELINE_COLUMNS = [
     ("📥 To Review", ["New", "Old"]),
     ("📇 Contact to Approach", ["Contact to approach"]),
@@ -607,7 +620,7 @@ def render_pipeline_card(job, show_advance=True):
 tab_pipeline, tab_companies = st.tabs(["🎯 Pipeline", "🏢 Company Directory"])
 
 # ---------------------------------------------------------------------------
-# PIPELINE — the main outreach-action screen.
+# PIPELINE
 # ---------------------------------------------------------------------------
 with tab_pipeline:
     @st.fragment
@@ -625,7 +638,6 @@ with tab_pipeline:
             )
 
         base_df = jobs_df if show_all_scores else jobs_df[jobs_df["match_score"] >= 55]
-        # Rejected is its own recovery stage below, not filtered out here.
         base_df = base_df[base_df["job_status"] != "Closed/Expired"]
 
         if base_df.empty:
@@ -677,15 +689,14 @@ with tab_pipeline:
     render_pipeline(jobs_df)
 
 # ---------------------------------------------------------------------------
-# COMPANY DIRECTORY — drill-down view with search, sort, and per-company
-# match breakdown plus a contact-availability indicator.
+# COMPANY DIRECTORY
 # ---------------------------------------------------------------------------
 with tab_companies:
     @st.fragment
     def render_company_directory(companies_df, jobs_df):
         st.subheader("Company Directory")
         if companies_df.empty:
-            st.info("No companies found. Run init_db.py to import your MBA referral Excel file first.")
+            st.info("No companies found. Upload your referral Excel file in the sidebar to populate.")
             return
 
         sc1, sc2 = st.columns([2, 2])
