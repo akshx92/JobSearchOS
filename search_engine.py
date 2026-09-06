@@ -367,7 +367,7 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
     cursor.execute("UPDATE jobs SET job_status = 'Old' WHERE job_status = 'New'")
     conn.commit()
 
-    cursor.execute("SELECT id, filename FROM cv_versions WHERE is_active = 1")
+    cursor.execute("SELECT id, filename FROM cv_versions WHERE is_active = TRUE")
     active_cv = cursor.fetchone()
     if not active_cv:
         conn.close()
