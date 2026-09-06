@@ -112,18 +112,23 @@ in exactly this shape:
             }
 
         except APIError as e:
-            if "429" in str(e):
+            error_str = str(e)
+            is_transient = any(code in error_str for code in ["429", "503", "500", "502", "504"])
+            if is_transient:
                 if attempt < max_retries - 1:
                     time.sleep(delay)
                     delay *= 2
                     continue
+                label = "RATE_LIMIT" if "429" in error_str else "SERVER_UNAVAILABLE"
+                rationale = ("API rate limit reached after retries." if "429" in error_str
+                             else "Gemini's servers were unavailable after retries (high demand) — try this job again later.")
                 return {
                     "match_score": 0, "alignment": "Unknown",
-                    "rationale": "API rate limit reached after retries.",
+                    "rationale": rationale,
                     "required_experience_min": None, "required_experience_max": None,
-                    "error": f"RATE_LIMIT: {e}",
+                    "error": f"{label}: {e}",
                 }
-            # Not a rate limit (e.g. 404 model not found, 400 bad request, 403 auth) —
+            # Not transient (e.g. 404 model not found, 400 bad request, 403 auth) —
             # retrying won't help, so fail fast with an accurate label instead of
             # burning through the backoff loop and calling it a rate limit.
             return {
