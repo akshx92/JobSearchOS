@@ -502,11 +502,15 @@ if not companies_df.empty:
         companies_df["job_count"] = 0
     companies_df["job_count"] = companies_df["job_count"].fillna(0).astype(int)
 
+conn = get_connection()
+error_log_count = pd.read_sql_query("SELECT COUNT(*) as c FROM error_log", conn).iloc[0]["c"]
+conn.close()
+
 total_jobs = len(jobs_df)
 top_match = int(jobs_df["match_score"].max()) if total_jobs > 0 else 0
 scanned_count = len(companies_df[companies_df["scan_status"] == "COMPLETED"])
 pending_count = len(companies_df[companies_df["scan_status"] == "NOT_SCANNED"])
-error_count = len(companies_df[companies_df["scan_status"] == "ERROR"])
+error_count = int(error_log_count)
 incomplete_count = len(companies_df[companies_df["scan_status"] == "INCOMPLETE"])
 actionable_count = len(jobs_df[(jobs_df["match_score"] >= 55) & (jobs_df["has_contact"])]) if total_jobs > 0 else 0
 
