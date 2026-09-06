@@ -358,7 +358,7 @@ if file_type == "CV":
         cur = conn.cursor()
         cur.execute("UPDATE cv_versions SET is_active = FALSE")
         cur.execute(
-            "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (%s, %s, 1)",
+            "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (%s, %s, TRUE)",
             (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         conn.commit()
