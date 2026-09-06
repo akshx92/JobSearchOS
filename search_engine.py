@@ -555,10 +555,19 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
                     if result.get("error"):
                         _log_error(cursor, comp_id, run_id, "AI_EVALUATION_ERROR", result["error"])
                         errors_logged += 1
-                        if "RATE_LIMIT" in result["error"]:
+                        if "RATE_LIMIT" in result["error"] or "SERVER_UNAVAILABLE" in result["error"]:
                             adaptive_delay = min(adaptive_delay + 10, MAX_EVAL_DELAY_SECONDS)
                     else:
                         adaptive_delay = max(EVAL_DELAY_SECONDS, adaptive_delay - 2)
+
+                    if result.get("error"):
+                        # Don't save a fake "Not a Match" for a job that never
+                        # actually got evaluated. Skipping the insert entirely
+                        # means it's not in the jobs table yet, so it won't be
+                        # caught by the "already known" dedup check next scan —
+                        # it'll get a genuine fresh evaluation attempt instead
+                        # of being permanently stuck at a bogus 0% score.
+                        continue
 
                     # Hard filter: experience — never overridden by a high match score
                     exp_min = result.get("required_experience_min")
