@@ -17,15 +17,20 @@ DB_FILE = "job_search_os.db"
 
 
 def get_db_url():
-    """Reads DATABASE_URL from Streamlit secrets first, then environment
-    variables. Returns None if neither is set (local SQLite mode)."""
+    """Reads DATABASE_URL from the environment first — this works reliably
+    from background threads, unlike st.secrets, which can silently fail to
+    resolve outside Streamlit's main script thread. app.py is responsible for
+    copying st.secrets into os.environ once at startup (see app.py's top)."""
+    env_val = os.getenv("DATABASE_URL")
+    if env_val:
+        return env_val
     try:
         import streamlit as st
         if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
             return st.secrets["DATABASE_URL"]
     except Exception:
         pass
-    return os.getenv("DATABASE_URL")
+    return None
 
 
 def is_postgres():
