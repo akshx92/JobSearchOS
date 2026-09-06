@@ -84,7 +84,7 @@ def tier_breakdown_str(comp_jobs):
 def get_setting(key, default=""):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    cur.execute("SELECT value FROM settings WHERE key = %s", (key,))
     row = cur.fetchone()
     conn.close()
     return row[0] if row else default
@@ -94,7 +94,7 @@ def set_setting(key, value):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute(
-        "INSERT INTO settings (key, value) VALUES (?, ?) "
+        "INSERT INTO settings (key, value) VALUES (%s, %s) "
         "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
         (key, value),
     )
@@ -145,13 +145,13 @@ def import_mba_excel(file_path):
             continue
         company_normalized = normalize_company_name(company_original)
 
-        cur.execute("SELECT id FROM companies WHERE normalized_name = ?", (company_normalized,))
+        cur.execute("SELECT id FROM companies WHERE normalized_name = %s", (company_normalized,))
         existing = cur.fetchone()
         if existing:
             company_id = existing[0]
         else:
             cur.execute(
-                "INSERT INTO companies (original_name, normalized_name) VALUES (?, ?)",
+                "INSERT INTO companies (original_name, normalized_name) VALUES (%s, %s)",
                 (company_original, company_normalized),
             )
             company_id = cur.lastrowid
@@ -162,7 +162,7 @@ def import_mba_excel(file_path):
         college = str(row.get(col_college, "") or "")
 
         cur.execute(
-            "INSERT INTO contacts (company_id, contact_name, phone, email, mba_college) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO contacts (company_id, contact_name, phone, email, mba_college) VALUES (%s, %s, %s, %s, %s)",
             (company_id, contact_name, phone, "", college),
         )
         total_contacts += 1
@@ -172,7 +172,7 @@ def import_mba_excel(file_path):
     return new_companies, total_contacts
 
 
-@st.dialog("Replace all contacts from this file?")
+@st.dialog("Replace all contacts from this file%s")
 def confirm_mba_import_dialog(mba_path):
     st.write("This will completely replace your current contacts list with what's in the uploaded file.")
     st.write("Companies are only ever added to, never deleted — your scan history is safe.")
@@ -236,7 +236,7 @@ def reset_all_scan_data():
     conn.close()
 
 
-@st.dialog("Reset all scan data?")
+@st.dialog("Reset all scan data%s")
 def confirm_reset_dialog():
     st.write("This permanently deletes:")
     st.markdown("- All discovered jobs\n- All scan records and search run history\n- All logged errors\n- All saved jobs")
@@ -358,7 +358,7 @@ if file_type == "CV":
         cur = conn.cursor()
         cur.execute("UPDATE cv_versions SET is_active = FALSE")
         cur.execute(
-            "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (?, ?, 1)",
+            "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (%s, %s, 1)",
             (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
         )
         conn.commit()
@@ -440,7 +440,7 @@ st.markdown("---")
 def get_contacts_df(company_id):
     conn = get_connection()
     contacts = pd.read_sql_query(
-        "SELECT contact_name, phone, email, mba_college FROM contacts WHERE company_id = ?",
+        "SELECT contact_name, phone, email, mba_college FROM contacts WHERE company_id = %s",
         conn, params=(company_id,)
     )
     conn.close()
@@ -487,7 +487,7 @@ def render_contact_and_outreach(job_id, company_id, job_title, company_name, key
 def update_job_status(job_row_id, new_status):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE jobs SET job_status = ? WHERE id = ?", (new_status, job_row_id))
+    cur.execute("UPDATE jobs SET job_status = %s WHERE id = %s", (new_status, job_row_id))
     conn.commit()
     conn.close()
 
