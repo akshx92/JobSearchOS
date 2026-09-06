@@ -6,3 +6,4 @@ google-genai
 pypdf
 jobdrop
 requests
+psycopg2-binary
