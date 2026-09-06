@@ -119,11 +119,11 @@ def build_outreach_message(user_name, contact_name, company_name, job_title, mba
     )
 
 
+from psycopg2.extras import execute_values
+
 def import_mba_excel(file_path):
-    """Refreshes contacts from an updated MBA referral Excel file.
-    Companies are only ever added to (never deleted), so existing scan
-    history, jobs, and pipeline progress are untouched. Contacts are fully
-    replaced each time, since the Excel is the authoritative snapshot."""
+    """Refreshes contacts from an updated MBA referral Excel file using
+    bulk operations to avoid per-row network round-trips to Supabase."""
     from init_db import normalize_company_name, clean_company_name_text, is_placeholder_company
 
     df = pd.read_excel(file_path)
@@ -134,10 +134,17 @@ def import_mba_excel(file_path):
 
     conn = get_connection()
     cur = conn.cursor()
+
+    # 1. Wipe existing contacts
     cur.execute("DELETE FROM contacts")
 
-    new_companies = 0
-    total_contacts = 0
+    # 2. Fetch all existing companies once into memory
+    cur.execute("SELECT normalized_name, id FROM companies")
+    company_map = {row[0]: row[1] for row in cur.fetchall()}
+
+    # 3. Identify new unique companies to insert
+    new_companies_to_insert = {}
+    parsed_rows = []
 
     for _, row in df.iterrows():
         company_original = clean_company_name_text(str(row.get(col_company, "") or ""))
@@ -145,31 +152,51 @@ def import_mba_excel(file_path):
             continue
         company_normalized = normalize_company_name(company_original)
 
-        cur.execute("SELECT id FROM companies WHERE normalized_name = %s", (company_normalized,))
-        existing = cur.fetchone()
-        if existing:
-            company_id = existing[0]
-        else:
-            cur.execute(
-                "INSERT INTO companies (original_name, normalized_name) VALUES (%s, %s) RETURNING id",
-                (company_original, company_normalized),
-            )
-            company_id = cur.fetchone()[0]
-            new_companies += 1
+        if company_normalized not in company_map and company_normalized not in new_companies_to_insert:
+            new_companies_to_insert[company_normalized] = company_original
 
         contact_name = str(row.get(col_name, "") or "")
         phone = str(row.get(col_phone, "") or "")
         college = str(row.get(col_college, "") or "")
 
-        cur.execute(
-            "INSERT INTO contacts (company_id, contact_name, phone, email, mba_college) VALUES (%s, %s, %s, %s, %s)",
-            (company_id, contact_name, phone, "", college),
-        )
-        total_contacts += 1
+        parsed_rows.append({
+            "normalized": company_normalized,
+            "name": contact_name,
+            "phone": phone,
+            "college": college
+        })
+
+    # 4. Bulk insert new companies and fetch back their IDs in a single round-trip
+    new_companies_count = len(new_companies_to_insert)
+    if new_companies_to_insert:
+        comp_records = [(orig, norm) for norm, orig in new_companies_to_insert.items()]
+        insert_comp_query = """
+            INSERT INTO companies (original_name, normalized_name)
+            VALUES %s
+            RETURNING normalized_name, id
+        """
+        new_ids = execute_values(cur, insert_comp_query, comp_records, fetch=True)
+        for norm, c_id in new_ids:
+            company_map[norm] = c_id
+
+    # 5. Prepare bulk contacts list and insert them all in a single query
+    contacts_records = []
+    for r in parsed_rows:
+        comp_id = company_map.get(r["normalized"])
+        if comp_id:
+            contacts_records.append((comp_id, r["name"], r["phone"], "", r["college"]))
+
+    total_contacts = len(contacts_records)
+    if contacts_records:
+        insert_contacts_query = """
+            INSERT INTO contacts (company_id, contact_name, phone, email, mba_college)
+            VALUES %s
+        """
+        execute_values(cur, insert_contacts_query, contacts_records)
 
     conn.commit()
     conn.close()
-    return new_companies, total_contacts
+    return new_companies_count, total_contacts
 
 
 @st.dialog("Replace all contacts from this file%s")
