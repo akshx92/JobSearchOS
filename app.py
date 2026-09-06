@@ -119,80 +119,106 @@ def build_outreach_message(user_name, contact_name, company_name, job_title, mba
     )
 
 
+import re
+import pandas as pd
 from psycopg2.extras import execute_values
 
-def import_mba_excel(file_path):
-    """Refreshes contacts from an updated MBA referral Excel file using
-    bulk operations to avoid per-row network round-trips to Supabase."""
-    from init_db import normalize_company_name, clean_company_name_text, is_placeholder_company
+# Hoist noise cleaning patterns to module level to avoid recompiling in loops
+NOISE_RE = re.compile(
+    r"\(.*?\)"
+    r"|\bstill to join\b|\byet to join\b|\bto join\b|\bjoining soon\b|\bjoining shortly\b"
+    r"|\bjoining next month\b|\bcurrently at\b|\bpreviously (?:at|with)\b|\bex[\s\-]+"
+    r"|\bformerly (?:at|with)\b",
+    re.IGNORECASE
+)
+PLACEHOLDERS = {"na", "n/a", "none", "self employed", "freelance", "freelancer", "tbd", "-", "unemployed"}
 
-    df = pd.read_excel(file_path)
-    col_company = "Current Company"
-    col_name = "Your full name"
-    col_phone = "Whatsapp no."
-    col_college = "Your MBA college"
+COMPANY_ALIASES = {
+    "jpmorgan": "jpmorganchase",
+    "jpmorgangroup": "jpmorganchase",
+    "ernstyoung": "ey",
+    "boozallen": "boozallenhamilton",
+    "bcg": "bostonconsultinggroup",
+    "mckinsey": "mckinseycompany",
+}
+
+def _fast_clean_company(raw):
+    text = NOISE_RE.sub("", str(raw or ""))
+    text = re.split(r"\s+-\s+|\s*,\s*", text, maxsplit=1)[0]
+    return re.sub(r"\s+", " ", text).strip(" -,:;")
+
+def _fast_normalize_company(name):
+    cleaned = _fast_clean_company(name).lower()
+    norm = re.sub(r"[^a-z0-9]", "", cleaned)
+    return COMPANY_ALIASES.get(norm, norm)
+
+def import_mba_excel(file_path):
+    # Read only the necessary 4 columns to avoid parsing heavy unused sheet columns
+    target_cols = ["Current Company", "Your full name", "Whatsapp no.", "Your MBA college"]
+    df = pd.read_excel(file_path, usecols=lambda c: c in target_cols)
 
     conn = get_connection()
     cur = conn.cursor()
 
-    # 1. Wipe existing contacts
+    # 1. Clear existing contacts
     cur.execute("DELETE FROM contacts")
 
-    # 2. Fetch all existing companies once into memory
+    # 2. Fetch existing companies map
     cur.execute("SELECT normalized_name, id FROM companies")
-    company_map = {row[0]: row[1] for row in cur.fetchall()}
+    company_map = dict(cur.fetchall())
 
-    # 3. Identify new unique companies to insert
-    new_companies_to_insert = {}
+    new_companies_dict = {}
     parsed_rows = []
 
-    for _, row in df.iterrows():
-        company_original = clean_company_name_text(str(row.get(col_company, "") or ""))
-        if not company_original or company_original.lower() == "nan" or is_placeholder_company(company_original):
+    for row in df.itertuples(index=False):
+        # Access attributes dynamically or by index
+        row_dict = row._asdict() if hasattr(row, "_asdict") else dict(zip(target_cols, row))
+        raw_company = row_dict.get("Current Company", "")
+        
+        orig_cleaned = _fast_clean_company(raw_company)
+        if not orig_cleaned or orig_cleaned.lower() in PLACEHOLDERS or orig_cleaned.lower() == "nan":
             continue
-        company_normalized = normalize_company_name(company_original)
 
-        if company_normalized not in company_map and company_normalized not in new_companies_to_insert:
-            new_companies_to_insert[company_normalized] = company_original
+        norm = _fast_normalize_company(orig_cleaned)
+        if norm not in company_map and norm not in new_companies_dict:
+            new_companies_dict[norm] = orig_cleaned
 
-        contact_name = str(row.get(col_name, "") or "")
-        phone = str(row.get(col_phone, "") or "")
-        college = str(row.get(col_college, "") or "")
+        parsed_rows.append((
+            norm,
+            str(row_dict.get("Your full name") or ""),
+            str(row_dict.get("Whatsapp no.") or ""),
+            str(row_dict.get("Your MBA college") or "")
+        ))
 
-        parsed_rows.append({
-            "normalized": company_normalized,
-            "name": contact_name,
-            "phone": phone,
-            "college": college
-        })
-
-    # 4. Bulk insert new companies and fetch back their IDs in a single round-trip
-    new_companies_count = len(new_companies_to_insert)
-    if new_companies_to_insert:
-        comp_records = [(orig, norm) for norm, orig in new_companies_to_insert.items()]
-        insert_comp_query = """
+    # 3. Bulk insert new companies
+    new_companies_count = len(new_companies_dict)
+    if new_companies_dict:
+        comp_tuples = [(orig, norm) for norm, orig in new_companies_dict.items()]
+        insert_comp_sql = """
             INSERT INTO companies (original_name, normalized_name)
             VALUES %s
+            ON CONFLICT (normalized_name) DO NOTHING
             RETURNING normalized_name, id
         """
-        new_ids = execute_values(cur, insert_comp_query, comp_records, fetch=True)
-        for norm, c_id in new_ids:
-            company_map[norm] = c_id
+        returned = execute_values(cur, insert_comp_sql, comp_tuples, fetch=True, page_size=500)
+        if returned:
+            for norm, c_id in returned:
+                company_map[norm] = c_id
 
-    # 5. Prepare bulk contacts list and insert them all in a single query
-    contacts_records = []
-    for r in parsed_rows:
-        comp_id = company_map.get(r["normalized"])
-        if comp_id:
-            contacts_records.append((comp_id, r["name"], r["phone"], "", r["college"]))
+    # 4. Bulk insert contacts
+    contacts_to_insert = []
+    for norm, name, phone, college in parsed_rows:
+        c_id = company_map.get(norm)
+        if c_id:
+            contacts_to_insert.append((c_id, name, phone, "", college))
 
-    total_contacts = len(contacts_records)
-    if contacts_records:
-        insert_contacts_query = """
+    total_contacts = len(contacts_to_insert)
+    if contacts_to_insert:
+        insert_contacts_sql = """
             INSERT INTO contacts (company_id, contact_name, phone, email, mba_college)
             VALUES %s
         """
-        execute_values(cur, insert_contacts_query, contacts_records)
+        execute_values(cur, insert_contacts_sql, contacts_to_insert, page_size=1000)
 
     conn.commit()
     conn.close()
