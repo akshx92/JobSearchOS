@@ -340,7 +340,7 @@ file_type = st.sidebar.selectbox("Manage", ["CV", "Referral File"], label_visibi
 
 if file_type == "CV":
     conn = get_connection()
-    active_cv_row = pd.read_sql_query("SELECT filename, uploaded_date FROM cv_versions WHERE is_active = 1", conn)
+    active_cv_row = pd.read_sql_query("SELECT filename, uploaded_date FROM cv_versions WHERE is_active = TRUE", conn)
     conn.close()
 
     if not active_cv_row.empty:
@@ -356,7 +356,7 @@ if file_type == "CV":
             f.write(uploaded_cv.getbuffer())
         conn = get_connection()
         cur = conn.cursor()
-        cur.execute("UPDATE cv_versions SET is_active = 0")
+        cur.execute("UPDATE cv_versions SET is_active = FALSE")
         cur.execute(
             "INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (?, ?, 1)",
             (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
