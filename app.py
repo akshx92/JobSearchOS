@@ -5,6 +5,8 @@ import threading
 import datetime
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import search_engine
+import os
+import psycopg2
 
 st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
 
@@ -33,6 +35,15 @@ st.markdown("""
 
 
 def get_connection():
+  # Read from Streamlit Secrets or local environment
+    db_url = None
+    if hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+        db_url = st.secrets["DATABASE_URL"]
+    else:
+        db_url = os.getenv("DATABASE_URL")
+
+    if db_url:
+        return psycopg2.connect(db_url)
     return sqlite3.connect(DB_FILE, timeout=15)
 
 
