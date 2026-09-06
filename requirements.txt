@@ -1,0 +1,8 @@
+streamlit>=1.37
+pandas
+openpyxl
+python-dotenv
+google-genai
+pypdf
+jobdrop
+requests
