@@ -1,3 +1,4 @@
+import os
 import re
 import datetime
 import threading
@@ -13,6 +14,14 @@ except ImportError:
     execute_values = None
 
 st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
+
+# CRITICAL: st.secrets is not reliably readable from background threads
+# (that's exactly how scans run), which was causing search_engine.py to
+# silently fall back to a local, table-less SQLite file mid-scan. Copying
+# the value into a plain environment variable here — in the main thread, at
+# startup — makes it visible to any thread for the rest of the process.
+if "DATABASE_URL" not in os.environ and hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
+    os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
 
 # ---------------------------------------------------------------------------
 # STYLING
