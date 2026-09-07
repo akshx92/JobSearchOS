@@ -475,23 +475,30 @@ if st.sidebar.button("Save Name", use_container_width=True):
 # ---------------------------------------------------------------------------
 st.title("🎯 Job Search OS")
 
+
+def load_jobs_df():
+    conn = get_connection()
+    df = pd.read_sql_query("""
+        SELECT j.*, COALESCE(c.original_name, 'Unknown Company') as company_name,
+               (SELECT COUNT(*) FROM contacts WHERE contacts.company_id = j.company_id) as contact_count
+        FROM jobs j
+        LEFT JOIN companies c ON j.company_id = c.id
+        ORDER BY j.date_discovered DESC, j.match_score DESC
+    """, conn)
+    conn.close()
+    if not df.empty:
+        df["has_contact"] = df["contact_count"] > 0
+    return df
+
+
 conn = get_connection()
-jobs_df = pd.read_sql_query("""
-    SELECT j.*, COALESCE(c.original_name, 'Unknown Company') as company_name,
-           (SELECT COUNT(*) FROM contacts WHERE contacts.company_id = j.company_id) as contact_count
-    FROM jobs j
-    LEFT JOIN companies c ON j.company_id = c.id
-    ORDER BY j.date_discovered DESC, j.match_score DESC
-""", conn)
 companies_df = pd.read_sql_query("""
     SELECT c.*,
            (SELECT COUNT(*) FROM contacts WHERE contacts.company_id = c.id) as contact_count
     FROM companies c ORDER BY c.id ASC
 """, conn)
 conn.close()
-
-if not jobs_df.empty:
-    jobs_df["has_contact"] = jobs_df["contact_count"] > 0
+jobs_df = load_jobs_df()
 
 if not companies_df.empty:
     companies_df["has_contact"] = companies_df["contact_count"] > 0
@@ -526,23 +533,31 @@ m7.metric("Errors", error_count)
 st.markdown("---")
 
 
-def get_contacts_df(company_id):
+def get_contacts_for_companies(company_ids):
+    """Fetches contacts for ALL given companies in a single query, instead of
+    one query per card. Popovers in Streamlit are not lazy — their contents
+    run on every script rerun whether opened or not — so without this,
+    every visible card triggers its own blocking database round-trip, which
+    is what was causing cards to render slowly and the checkbox toggle to
+    show a stale/overlapping mix of results mid-render."""
+    ids = sorted(set(int(c) for c in company_ids if c is not None))
+    if not ids:
+        return {}
+    placeholders = ", ".join(["?"] * len(ids))
     conn = get_connection()
-    contacts = pd.read_sql_query(
-        q("SELECT contact_name, phone, email, mba_college FROM contacts WHERE company_id = ?"),
-        conn, params=(company_id,)
+    df = pd.read_sql_query(
+        q(f"SELECT company_id, contact_name, phone, email, mba_college FROM contacts WHERE company_id IN ({placeholders})"),
+        conn, params=ids,
     )
     conn.close()
-    return contacts
+    return {cid: group.reset_index(drop=True) for cid, group in df.groupby("company_id")}
 
 
-def render_contact_and_outreach(job_id, company_id, job_title, company_name, key_prefix="pl"):
-    contacts = get_contacts_df(company_id)
+def render_contact_and_outreach(job_id, company_id, job_title, company_name, contacts_map, user_name, key_prefix="pl"):
+    contacts = contacts_map.get(company_id, pd.DataFrame())
     if contacts.empty:
         st.warning("⚠️ No referral contact available in MBA database.")
         return
-
-    user_name = get_setting("user_name", "")
 
     for idx, row in contacts.iterrows():
         name, phone, email, college = clean(row["contact_name"]), clean(row["phone"]), clean(row["email"]), clean(row["mba_college"])
@@ -602,7 +617,7 @@ NEXT_STAGE = {
 PIPELINE_PAGE_SIZE = 9
 
 
-def render_pipeline_card(job, show_advance=True):
+def render_pipeline_card(job, contacts_map, user_name, show_advance=True):
     tier_label, tier_color = match_tier(job["match_score"])
     contact_badge = "📇 Has contact" if job["has_contact"] else "No contact"
     contact_color = "green" if job["has_contact"] else "gray"
@@ -617,7 +632,7 @@ def render_pipeline_card(job, show_advance=True):
             st.markdown(f"[🔗 View Job]({job['job_url']})")
 
         with st.popover("📇 Contact & Outreach", use_container_width=True):
-            render_contact_and_outreach(job["id"], job["company_id"], job["job_title"], job["company_name"], key_prefix="pl")
+            render_contact_and_outreach(job["id"], job["company_id"], job["job_title"], job["company_name"], contacts_map, user_name, key_prefix="pl")
 
         if is_rejected:
             if st.button("↩ Restore to Review", key=f"restore_{job['id']}", use_container_width=True):
@@ -643,8 +658,14 @@ tab_pipeline, tab_companies = st.tabs(["🎯 Pipeline", "🏢 Company Directory"
 # PIPELINE
 # ---------------------------------------------------------------------------
 with tab_pipeline:
-    @st.fragment
-    def render_pipeline(jobs_df):
+    @st.fragment(run_every=5 if st.session_state.scan_state["running"] else None)
+    def render_pipeline():
+        # Re-fetches fresh from the database on every call. While a scan is
+        # running, this fragment re-runs every 5 seconds on its own, so
+        # newly-discovered jobs show up here without waiting for the scan
+        # to finish or the user to interact with anything.
+        jobs_df = load_jobs_df()
+
         if jobs_df.empty:
             st.info("No jobs yet. Run a scan from the sidebar to get started.")
             return
@@ -670,6 +691,12 @@ with tab_pipeline:
             base_df = base_df.sort_values(by="match_score", ascending=False)
         else:
             base_df = base_df.sort_values(by="company_name", ascending=True)
+
+        # Fetch contacts and the user's name ONCE for everything visible,
+        # instead of once per card — this is what was making the checkbox
+        # toggle feel slow and glitchy.
+        contacts_map = get_contacts_for_companies(base_df["company_id"].unique().tolist())
+        user_name = get_setting("user_name", "")
 
         stage_dfs = [base_df[base_df["job_status"].isin(statuses)].copy() for _, statuses in PIPELINE_COLUMNS]
 
@@ -704,9 +731,9 @@ with tab_pipeline:
                 card_cols = st.columns(3)
                 for idx, (_, job) in enumerate(page_df.iterrows()):
                     with card_cols[idx % 3]:
-                        render_pipeline_card(job)
+                        render_pipeline_card(job, contacts_map, user_name)
 
-    render_pipeline(jobs_df)
+    render_pipeline()
 
 # ---------------------------------------------------------------------------
 # COMPANY DIRECTORY
