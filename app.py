@@ -347,6 +347,10 @@ if "comp_page" not in st.session_state:
     st.session_state.comp_page = 1
 if "pipeline_cache" not in st.session_state:
     st.session_state.pipeline_cache = None
+if "pipeline_contacts_cache" not in st.session_state:
+    st.session_state.pipeline_contacts_cache = {}
+if "pipeline_username_cache" not in st.session_state:
+    st.session_state.pipeline_username_cache = ""
 if "pipeline_needs_refresh" not in st.session_state:
     st.session_state.pipeline_needs_refresh = True
 
@@ -539,6 +543,7 @@ with st.sidebar.expander("👤 Your Details"):
     user_name_input = st.text_input("Your name (used in outreach messages)", value=get_setting("user_name", ""))
     if st.button("Save Name", use_container_width=True):
         set_setting("user_name", user_name_input)
+        invalidate_pipeline_cache()
         st.toast("Saved")
 
 # ---------------------------------------------------------------------------
@@ -769,9 +774,18 @@ with tab_pipeline:
             or st.session_state.scan_state["running"]
         )
         if needs_fresh:
-            st.session_state.pipeline_cache = load_jobs_df()
+            fresh_jobs_df = load_jobs_df()
+            st.session_state.pipeline_cache = fresh_jobs_df
+            # Computed from the FULL job set (not the filtered view below), so
+            # toggling the checkbox/sort/pagination never needs to touch these
+            # again — they only change when the underlying data actually does.
+            all_company_ids = fresh_jobs_df["company_id"].unique().tolist() if not fresh_jobs_df.empty else []
+            st.session_state.pipeline_contacts_cache = get_contacts_for_companies(all_company_ids)
+            st.session_state.pipeline_username_cache = get_setting("user_name", "")
             st.session_state.pipeline_needs_refresh = False
         jobs_df = st.session_state.pipeline_cache
+        contacts_map = st.session_state.pipeline_contacts_cache
+        user_name = st.session_state.pipeline_username_cache
 
         if jobs_df.empty:
             st.info("No jobs yet. Run a scan from the sidebar to get started.")
@@ -798,12 +812,6 @@ with tab_pipeline:
             base_df = base_df.sort_values(by="match_score", ascending=False)
         else:
             base_df = base_df.sort_values(by="company_name", ascending=True)
-
-        # Fetch contacts and the user's name ONCE for everything visible,
-        # instead of once per card — this is what was making the checkbox
-        # toggle feel slow and glitchy.
-        contacts_map = get_contacts_for_companies(base_df["company_id"].unique().tolist())
-        user_name = get_setting("user_name", "")
 
         stage_dfs = [base_df[base_df["job_status"].isin(statuses)].copy() for _, statuses in PIPELINE_COLUMNS]
 

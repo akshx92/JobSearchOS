@@ -335,13 +335,19 @@ def verify_job_links(limit=30):
     return f"Checked {checked} links: {expired} now marked Closed/Expired, {errors} couldn't be verified this time."
 
 
-def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None, owner_label="app"):
+def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None, owner_label="app", max_duration_minutes=None):
     """Public entry point — wraps the real scan logic in a safety net so any
     unexpected exception (e.g. a locked database file) still resets
     scan_state, instead of leaving the progress bar and Stop button frozen
     forever with no error shown. Also enforces a scan lock so two scans
     (e.g. a scheduled GitHub Actions run and a manual 'Recheck Now') can
-    never run at the same time."""
+    never run at the same time.
+
+    max_duration_minutes: if set, the scan stops gracefully (finishing the
+    current company cleanly) once this much time has elapsed, rather than
+    processing exactly `limit` companies no matter how long it takes. This
+    is what makes a large 'process everything pending' run safe to schedule
+    without risking a hard timeout kill mid-write."""
     if not try_acquire_scan_lock(owner_label=owner_label):
         is_locked, owner, held_since = get_scan_lock_status()
         msg = f"Another scan is already in progress (started by '{owner}' at {held_since}). Try again shortly."
@@ -354,6 +360,7 @@ def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, sing
         return _run_scan_impl(
             limit=limit, mode=mode, scan_state=scan_state,
             stop_event=stop_event, single_company=single_company,
+            max_duration_minutes=max_duration_minutes,
         )
     except Exception as e:
         if scan_state is not None:
@@ -364,14 +371,23 @@ def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, sing
         release_scan_lock()
 
 
-def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None):
+def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None, max_duration_minutes=None):
     """
     mode: 'next_batch' | 'retry_errors' | 'new_run' | 'freshness_check' | 'recheck'
     single_company: (company_id, company_name) tuple — required when mode == 'recheck'
     scan_state: a plain dict (NOT a Streamlit widget) used to report progress safely
                 from a background thread. Keys: running, current, total, message.
     stop_event: a threading.Event() the UI can set to request a graceful stop.
+    max_duration_minutes: if set, stop gracefully after this much wall-clock
+                time has passed, regardless of how many companies remain.
     """
+    scan_started_at = time.time()
+
+    def time_limit_exceeded():
+        if max_duration_minutes is None:
+            return False
+        return (time.time() - scan_started_at) > (max_duration_minutes * 60)
+
     conn = get_connection()
     cursor = conn.cursor()
 
@@ -434,6 +450,11 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
         if stop_event and stop_event.is_set():
             if scan_state is not None:
                 scan_state["message"] = "Scan stopped by user."
+            break
+
+        if time_limit_exceeded():
+            if scan_state is not None:
+                scan_state["message"] = f"Time limit ({max_duration_minutes} min) reached — stopping gracefully. Remaining companies stay pending for the next run."
             break
 
         scan_date = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
