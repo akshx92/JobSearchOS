@@ -6,11 +6,13 @@ import pandas as pd
 import streamlit as st
 from streamlit.runtime.scriptrunner import add_script_run_ctx
 import search_engine
-from db_utils import get_connection, is_postgres, q
+from db_utils import get_connection, is_postgres, q, get_scan_lock_status
 
 try:
+    import psycopg2
     from psycopg2.extras import execute_values
 except ImportError:
+    psycopg2 = None
     execute_values = None
 
 st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
@@ -22,6 +24,49 @@ st.set_page_config(page_title="Job Search OS", page_icon="🎯", layout="wide")
 # startup — makes it visible to any thread for the rest of the process.
 if "DATABASE_URL" not in os.environ and hasattr(st, "secrets") and "DATABASE_URL" in st.secrets:
     os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
+
+if "APP_PASSWORD" not in os.environ and hasattr(st, "secrets") and "APP_PASSWORD" in st.secrets:
+    os.environ["APP_PASSWORD"] = st.secrets["APP_PASSWORD"]
+
+
+def check_password():
+    """Blocks access to the entire app until the correct password is
+    entered. This app shows real names, phone numbers, and emails from your
+    MBA referral list, plus your CV — it must never be left open to anyone
+    with the URL. If no APP_PASSWORD is configured at all (e.g. local
+    testing), this check is skipped so local development still works."""
+    configured_password = os.environ.get("APP_PASSWORD")
+    if not configured_password:
+        return True
+
+    if st.session_state.get("authenticated", False):
+        return True
+
+    st.title("🔒 Job Search OS")
+    st.caption("This app contains private contact information. Enter the password to continue.")
+    entered = st.text_input("Password", type="password", key="password_attempt")
+    if st.button("Enter"):
+        if entered == configured_password:
+            st.session_state.authenticated = True
+            st.rerun()
+        else:
+            st.error("Incorrect password.")
+    return False
+
+
+if not check_password():
+    st.stop()
+
+
+def queue_toast(message, icon="✅"):
+    """Queues a lightweight toast notification to show right after the next
+    rerun, instead of a full-width success/warning banner that shifts the
+    page layout. st.toast() calls made right before st.rerun() get lost
+    since the rerun interrupts them, so we stash it in session_state and
+    display it at the very top of the next script run instead."""
+    if "pending_toasts" not in st.session_state:
+        st.session_state.pending_toasts = []
+    st.session_state.pending_toasts.append((message, icon))
 
 # ---------------------------------------------------------------------------
 # STYLING
@@ -41,6 +86,16 @@ st.markdown("""
     }
     [data-testid="stAppViewContainer"] { background-image: none !important; }
     .block-container { padding-top: 1.5rem !important; max-width: 1400px; }
+
+    .badge {
+        display: inline-block; padding: 3px 12px; border-radius: 999px;
+        font-size: 0.78rem; font-weight: 600; margin-right: 6px;
+    }
+    .badge-strong { background: rgba(34, 197, 94, 0.15); color: #4ade80; }
+    .badge-possible { background: rgba(245, 158, 11, 0.15); color: #fbbf24; }
+    .badge-nomatch { background: rgba(148, 163, 184, 0.15); color: #94a3b8; }
+    .badge-contact { background: rgba(99, 102, 241, 0.18); color: #a5b4fc; }
+    .badge-nocontact { background: rgba(148, 163, 184, 0.10); color: #64748b; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -55,11 +110,11 @@ def clean(val):
 
 def match_tier(score):
     if score >= 80:
-        return "Strong Match", "green"
+        return "Strong Match", "badge-strong"
     elif score >= 55:
-        return "Possible Match", "orange"
+        return "Possible Match", "badge-possible"
     else:
-        return "Not a Match", "red"
+        return "Not a Match", "badge-nomatch"
 
 
 def tier_breakdown_str(comp_jobs):
@@ -270,13 +325,18 @@ def confirm_mba_import_dialog(mba_path):
         if st.button("Yes, replace contacts", type="primary", use_container_width=True):
             with st.spinner("Updating contacts..."):
                 new_companies, total_contacts = import_mba_excel(mba_path)
-            st.session_state["mba_import_result"] = f"Done: {new_companies} new companies added, {total_contacts} contacts imported."
+            queue_toast(f"Done: {new_companies} new companies added, {total_contacts} contacts imported.")
             st.rerun()
 
 
 # ---------------------------------------------------------------------------
 # SESSION STATE
 # ---------------------------------------------------------------------------
+if "pending_toasts" in st.session_state and st.session_state.pending_toasts:
+    for msg, icon in st.session_state.pending_toasts:
+        st.toast(msg, icon=icon)
+    st.session_state.pending_toasts = []
+
 if "scan_state" not in st.session_state:
     st.session_state.scan_state = {"running": False, "current": 0, "total": 0, "message": ""}
 if "scan_was_running" not in st.session_state:
@@ -285,6 +345,19 @@ if "stop_event" not in st.session_state:
     st.session_state.stop_event = threading.Event()
 if "comp_page" not in st.session_state:
     st.session_state.comp_page = 1
+if "pipeline_cache" not in st.session_state:
+    st.session_state.pipeline_cache = None
+if "pipeline_needs_refresh" not in st.session_state:
+    st.session_state.pipeline_needs_refresh = True
+
+
+def invalidate_pipeline_cache():
+    """Call this after anything that actually changes job data (status
+    updates, a scan finishing). Pure UI interactions — checkbox, sort,
+    pagination — should NOT call this; they just re-filter the cached data
+    in memory, which is what makes them instant instead of re-hitting the
+    database on every click."""
+    st.session_state.pipeline_needs_refresh = True
 
 
 def start_scan(mode, limit, single_company=None):
@@ -301,6 +374,7 @@ def start_scan(mode, limit, single_company=None):
             "scan_state": st.session_state.scan_state,
             "stop_event": st.session_state.stop_event,
             "single_company": single_company,
+            "owner_label": f"app:{mode}",
         },
         daemon=True,
     )
@@ -373,7 +447,7 @@ with col_d:
 if st.sidebar.button("🔗 Verify Links (30)", disabled=scan_disabled, use_container_width=True):
     with st.spinner("Checking stored job links..."):
         verify_msg = search_engine.verify_job_links(limit=30)
-    st.sidebar.success(verify_msg)
+    queue_toast(verify_msg)
     st.rerun()
 
 
@@ -389,6 +463,7 @@ def scan_progress_widget():
     else:
         if st.session_state.scan_was_running:
             st.session_state.scan_was_running = False
+            invalidate_pipeline_cache()
             st.rerun()
         if state["message"]:
             st.info(state["message"])
@@ -420,55 +495,51 @@ with st.sidebar.expander("🔴 Recent Errors"):
 
 # --- FILES (middle) ---
 st.sidebar.markdown("---")
-st.sidebar.subheader("📁 Files")
-file_type = st.sidebar.selectbox("Manage", ["CV", "Referral File"], label_visibility="collapsed")
+with st.sidebar.expander("📁 Files (CV / Referral List)"):
+    file_type = st.selectbox("Manage", ["CV", "Referral File"], label_visibility="collapsed")
 
-if file_type == "CV":
-    conn = get_connection()
-    active_cv_row = pd.read_sql_query("SELECT filename, uploaded_date FROM cv_versions WHERE is_active = TRUE", conn)
-    conn.close()
-
-    if not active_cv_row.empty:
-        st.sidebar.success(f"Active: {active_cv_row.iloc[0]['filename']}")
-        st.sidebar.caption(f"Uploaded: {active_cv_row.iloc[0]['uploaded_date']}")
-    else:
-        st.sidebar.warning("No active CV set.")
-
-    uploaded_cv = st.sidebar.file_uploader("Upload new CV (PDF)", type=["pdf"])
-    if uploaded_cv is not None and st.sidebar.button("Set as Active CV", use_container_width=True):
-        filename = f"CV_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
-        with open(filename, "wb") as f:
-            f.write(uploaded_cv.getbuffer())
+    if file_type == "CV":
         conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE cv_versions SET is_active = FALSE")
-        cur.execute(
-            q("INSERT INTO cv_versions (filename, uploaded_date, is_active) VALUES (?, ?, TRUE)"),
-            (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")),
-        )
-        conn.commit()
+        active_cv_row = pd.read_sql_query("SELECT filename, uploaded_date FROM cv_versions WHERE is_active = TRUE", conn)
         conn.close()
-        st.sidebar.success(f"Active CV updated: {filename}")
-        st.rerun()
 
-else:  # Referral File
-    st.sidebar.caption("Upload monthly to refresh contacts. Existing scan history is preserved — only new companies get added.")
-    if "mba_import_result" in st.session_state:
-        st.sidebar.success(st.session_state.pop("mba_import_result"))
-    uploaded_mba = st.sidebar.file_uploader("Upload updated MBA Excel", type=["xlsx"])
-    if uploaded_mba is not None and st.sidebar.button("Update Contacts from Excel", use_container_width=True):
-        mba_path = "MBA referrals - Mumbai - List of Members.xlsx"
-        with open(mba_path, "wb") as f:
-            f.write(uploaded_mba.getbuffer())
-        confirm_mba_import_dialog(mba_path)
+        if not active_cv_row.empty:
+            st.success(f"Active: {active_cv_row.iloc[0]['filename']}")
+            st.caption(f"Uploaded: {active_cv_row.iloc[0]['uploaded_date']}")
+        else:
+            st.warning("No active CV set.")
 
-# --- YOUR DETAILS (bottom) ---
-st.sidebar.markdown("---")
-st.sidebar.subheader("👤 Your Details")
-user_name_input = st.sidebar.text_input("Your name (used in outreach messages)", value=get_setting("user_name", ""))
-if st.sidebar.button("Save Name", use_container_width=True):
-    set_setting("user_name", user_name_input)
-    st.sidebar.success("Saved")
+        uploaded_cv = st.file_uploader("Upload new CV (PDF)", type=["pdf"])
+        if uploaded_cv is not None and st.button("Set as Active CV", use_container_width=True):
+            filename = uploaded_cv.name or f"CV_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+            file_bytes = uploaded_cv.getvalue()
+            conn = get_connection()
+            cur = conn.cursor()
+            cur.execute("UPDATE cv_versions SET is_active = FALSE")
+            cur.execute(
+                q("INSERT INTO cv_versions (filename, uploaded_date, is_active, file_content) VALUES (?, ?, TRUE, ?)"),
+                (filename, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                 psycopg2.Binary(file_bytes) if is_postgres() else file_bytes),
+            )
+            conn.commit()
+            conn.close()
+            queue_toast(f"Active CV updated: {filename}")
+            st.rerun()
+
+    else:  # Referral File
+        st.caption("Upload monthly to refresh contacts. Existing scan history is preserved — only new companies get added.")
+        uploaded_mba = st.file_uploader("Upload updated MBA Excel", type=["xlsx"])
+        if uploaded_mba is not None and st.button("Update Contacts from Excel", use_container_width=True):
+            mba_path = "MBA referrals - Mumbai - List of Members.xlsx"
+            with open(mba_path, "wb") as f:
+                f.write(uploaded_mba.getbuffer())
+            confirm_mba_import_dialog(mba_path)
+
+with st.sidebar.expander("👤 Your Details"):
+    user_name_input = st.text_input("Your name (used in outreach messages)", value=get_setting("user_name", ""))
+    if st.button("Save Name", use_container_width=True):
+        set_setting("user_name", user_name_input)
+        st.toast("Saved")
 
 # ---------------------------------------------------------------------------
 # MAIN HEADER + METRICS
@@ -530,6 +601,25 @@ m5.metric("Pending", pending_count)
 m6.metric("Incomplete", incomplete_count)
 m7.metric("Errors", error_count)
 
+# Last Scan status — surfaces runs triggered from anywhere (this app, a
+# manual Recheck, or an external scheduler like GitHub Actions), so a
+# failure is visible here without needing to check GitHub's own logs.
+is_locked, lock_owner, lock_since = get_scan_lock_status()
+if is_locked:
+    st.info(f"🔄 A scan is currently running (triggered by **{lock_owner}**, started {lock_since}).")
+else:
+    conn = get_connection()
+    last_run = pd.read_sql_query(
+        "SELECT start_time, end_time, companies_scanned, relevant_jobs_found, errors FROM search_runs ORDER BY id DESC LIMIT 1",
+        conn,
+    )
+    conn.close()
+    if not last_run.empty:
+        r = last_run.iloc[0]
+        status_note = "✅" if r["errors"] == 0 else f"⚠️ {r['errors']} errors"
+        finished = "still running or crashed without finishing" if not r["end_time"] else f"finished {r['end_time']}"
+        st.caption(f"Last scan: started {r['start_time']}, {finished} · {r['companies_scanned']} companies, {r['relevant_jobs_found']} jobs found · {status_note}")
+
 st.markdown("---")
 
 
@@ -582,7 +672,8 @@ def render_contact_and_outreach(job_id, company_id, job_title, company_name, con
 
         if st.button("✅ Mark as Contacted", key=f"contacted_{key_prefix}_{job_id}_{idx}", use_container_width=True):
             update_job_status(job_id, "Contacted")
-            st.success("Marked as Contacted.")
+            invalidate_pipeline_cache()
+            queue_toast("Marked as Contacted.")
             st.rerun()
 
         st.markdown("---")
@@ -618,25 +709,30 @@ PIPELINE_PAGE_SIZE = 9
 
 
 def render_pipeline_card(job, contacts_map, user_name, show_advance=True):
-    tier_label, tier_color = match_tier(job["match_score"])
-    contact_badge = "📇 Has contact" if job["has_contact"] else "No contact"
-    contact_color = "green" if job["has_contact"] else "gray"
+    tier_label, tier_class = match_tier(job["match_score"])
+    contact_class = "badge-contact" if job["has_contact"] else "badge-nocontact"
+    contact_label = "Has contact" if job["has_contact"] else "No contact"
     is_rejected = job["job_status"] == "Rejected"
 
     with st.container(border=True):
         st.markdown(f"**{job['job_title']}**")
         st.caption(job["company_name"])
-        st.markdown(f":{tier_color}[{tier_label} · {job['match_score']}%]  ·  :{contact_color}[{contact_badge}]")
+        st.markdown(
+            f'<span class="badge {tier_class}">{tier_label} · {job["match_score"]}%</span>'
+            f'<span class="badge {contact_class}">{contact_label}</span>',
+            unsafe_allow_html=True,
+        )
 
         if job["job_url"]:
-            st.markdown(f"[🔗 View Job]({job['job_url']})")
+            st.markdown(f"[View Job ↗]({job['job_url']})")
 
-        with st.popover("📇 Contact & Outreach", use_container_width=True):
+        with st.popover("Contact & Outreach", use_container_width=True):
             render_contact_and_outreach(job["id"], job["company_id"], job["job_title"], job["company_name"], contacts_map, user_name, key_prefix="pl")
 
         if is_rejected:
             if st.button("↩ Restore to Review", key=f"restore_{job['id']}", use_container_width=True):
                 update_job_status(job["id"], "New")
+                invalidate_pipeline_cache()
                 st.rerun()
         else:
             btn_cols = st.columns(2)
@@ -645,10 +741,12 @@ def render_pipeline_card(job, contacts_map, user_name, show_advance=True):
                 if show_advance and next_stage:
                     if st.button(f"→ {next_stage}", key=f"advance_{job['id']}", use_container_width=True):
                         update_job_status(job["id"], next_stage)
+                        invalidate_pipeline_cache()
                         st.rerun()
             with btn_cols[1]:
                 if st.button("✕ Reject", key=f"reject_{job['id']}", use_container_width=True):
                     update_job_status(job["id"], "Rejected")
+                    invalidate_pipeline_cache()
                     st.rerun()
 
 
@@ -660,17 +758,26 @@ tab_pipeline, tab_companies = st.tabs(["🎯 Pipeline", "🏢 Company Directory"
 with tab_pipeline:
     @st.fragment(run_every=5 if st.session_state.scan_state["running"] else None)
     def render_pipeline():
-        # Re-fetches fresh from the database on every call. While a scan is
-        # running, this fragment re-runs every 5 seconds on its own, so
-        # newly-discovered jobs show up here without waiting for the scan
-        # to finish or the user to interact with anything.
-        jobs_df = load_jobs_df()
+        # Only hits the database when something actually requires fresh data:
+        # first load, a live scan tick, or right after a status-changing
+        # action flagged invalidate_pipeline_cache(). Pure UI interactions
+        # (checkbox, sort, pagination) just re-filter the cached DataFrame in
+        # memory — instant, no database round-trip, no stale-render flicker.
+        needs_fresh = (
+            st.session_state.pipeline_cache is None
+            or st.session_state.pipeline_needs_refresh
+            or st.session_state.scan_state["running"]
+        )
+        if needs_fresh:
+            st.session_state.pipeline_cache = load_jobs_df()
+            st.session_state.pipeline_needs_refresh = False
+        jobs_df = st.session_state.pipeline_cache
 
         if jobs_df.empty:
             st.info("No jobs yet. Run a scan from the sidebar to get started.")
             return
 
-        f1, f2 = st.columns([1.5, 1.5])
+        f1, f2, f3 = st.columns([2, 1, 3])
         with f1:
             show_all_scores = st.checkbox("Include low-relevance matches (below 55%)", value=False)
         with f2:
@@ -769,7 +876,7 @@ with tab_companies:
         else:
             filtered_companies = filtered_companies.sort_values(by="original_name", ascending=True)
 
-        comp_items_per_page = 10
+        comp_items_per_page = 15
         comp_total_items = len(filtered_companies)
         comp_total_pages = max(1, (comp_total_items + comp_items_per_page - 1) // comp_items_per_page)
         st.session_state.comp_page = min(st.session_state.comp_page, comp_total_pages)
@@ -786,35 +893,75 @@ with tab_companies:
         c_start = (st.session_state.comp_page - 1) * comp_items_per_page
         page_companies = filtered_companies.iloc[c_start:c_start + comp_items_per_page]
 
-        for _, comp in page_companies.iterrows():
-            comp_id, comp_name, status = comp["id"], comp["original_name"], comp["scan_status"]
-            comp_jobs = jobs_df[jobs_df["company_id"] == comp_id] if not jobs_df.empty else pd.DataFrame()
-            status_badge = {"COMPLETED": "🟢", "ERROR": "🔴", "IN_PROGRESS": "🟡", "INCOMPLETE": "🟠"}.get(status, "⚪")
-            contact_badge = "📇" if comp["has_contact"] else "▫️"
+        if "selected_company_id" not in st.session_state:
+            st.session_state.selected_company_id = None
+
+        # Default to the first company on the current page if nothing (or
+        # something no longer on this page) is selected, so the detail
+        # panel is never empty on first load.
+        visible_ids = page_companies["id"].tolist()
+        if st.session_state.selected_company_id not in visible_ids and visible_ids:
+            st.session_state.selected_company_id = visible_ids[0]
+
+        list_col, detail_col = st.columns([1.3, 2.2])
+
+        with list_col:
+            for _, comp in page_companies.iterrows():
+                comp_id, comp_name, status = comp["id"], comp["original_name"], comp["scan_status"]
+                status_dot = {"COMPLETED": "🟢", "ERROR": "🔴", "IN_PROGRESS": "🟡", "INCOMPLETE": "🟠"}.get(status, "⚪")
+                contact_mark = "📇" if comp["has_contact"] else ""
+                is_selected = comp_id == st.session_state.selected_company_id
+                label = f"{status_dot} {contact_mark} {comp_name}"
+                if st.button(
+                    label, key=f"select_company_{comp_id}", use_container_width=True,
+                    type="primary" if is_selected else "secondary",
+                ):
+                    st.session_state.selected_company_id = comp_id
+                    st.rerun()
+
+        with detail_col:
+            selected_id = st.session_state.selected_company_id
+            if selected_id is None:
+                st.info("Select a company from the list to see details.")
+                return
+
+            comp_row = companies_df[companies_df["id"] == selected_id]
+            if comp_row.empty:
+                st.info("Select a company from the list to see details.")
+                return
+            comp = comp_row.iloc[0]
+            comp_name, status = comp["original_name"], comp["scan_status"]
+            comp_jobs = jobs_df[jobs_df["company_id"] == selected_id] if not jobs_df.empty else pd.DataFrame()
             breakdown = tier_breakdown_str(comp_jobs)
 
-            with st.expander(f"{status_badge} {contact_badge} {comp_name} — {status} · {breakdown}"):
-                col_x, col_y = st.columns([3, 1])
-                with col_x:
-                    st.caption(f"First scanned: {clean(comp['first_scanned_date']) or '—'} · Last scanned: {clean(comp['last_scanned_date']) or '—'}")
-                    st.caption("📇 Has MBA contact" if comp["has_contact"] else "No MBA contact on file")
-                with col_y:
-                    if st.button("Recheck Now", key=f"recheck_{comp_id}", disabled=st.session_state.scan_state["running"]):
-                        with st.spinner(f"Checking career pages + job boards for {comp_name}... this can take 2-3 minutes."):
-                            result_msg = search_engine.run_scan(
-                                limit=1, mode="recheck", single_company=(comp_id, comp_name)
-                            )
-                        st.success(result_msg)
-                        st.rerun()
+            with st.container(border=True):
+                st.markdown(f"### {comp_name}")
+                st.markdown(
+                    f'<span class="badge {"badge-contact" if comp["has_contact"] else "badge-nocontact"}">'
+                    f'{"Has MBA contact" if comp["has_contact"] else "No MBA contact on file"}</span>',
+                    unsafe_allow_html=True,
+                )
+                st.caption(f"Status: {status} · {breakdown}")
+                st.caption(f"First scanned: {clean(comp['first_scanned_date']) or '—'} · Last scanned: {clean(comp['last_scanned_date']) or '—'}")
 
-                if not comp_jobs.empty:
-                    st.dataframe(
-                        comp_jobs[["job_title", "match_score", "job_status", "posting_date", "job_url"]],
-                        width="stretch",
-                        column_config={"job_url": st.column_config.LinkColumn("Link")},
-                        hide_index=True,
-                    )
-                else:
-                    st.write("No matching job records for this company yet.")
+                if st.button("Recheck Now", key=f"recheck_{selected_id}", disabled=st.session_state.scan_state["running"]):
+                    with st.spinner(f"Checking career pages + job boards for {comp_name}... this can take 2-3 minutes."):
+                        result_msg = search_engine.run_scan(
+                            limit=1, mode="recheck", single_company=(selected_id, comp_name),
+                            owner_label="app:recheck",
+                        )
+                    invalidate_pipeline_cache()
+                    queue_toast(result_msg)
+                    st.rerun()
+
+            if not comp_jobs.empty:
+                st.dataframe(
+                    comp_jobs[["job_title", "match_score", "job_status", "posting_date", "job_url"]],
+                    width="stretch",
+                    column_config={"job_url": st.column_config.LinkColumn("Link")},
+                    hide_index=True,
+                )
+            else:
+                st.write("No matching job records for this company yet.")
 
     render_company_directory(companies_df, jobs_df)

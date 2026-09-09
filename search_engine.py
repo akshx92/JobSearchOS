@@ -4,8 +4,8 @@ import re
 import logging
 from jobdrop import scrape_jobs
 import pandas as pd
-from ai_evaluator import evaluate_job_match, load_cv
-from db_utils import get_connection, q, insert_and_get_id, is_postgres
+from ai_evaluator import evaluate_job_match, load_cv_from_bytes
+from db_utils import get_connection, q, insert_and_get_id, is_postgres, try_acquire_scan_lock, release_scan_lock, get_scan_lock_status
 
 TARGET_ROLES = (
     "Project Manager OR Program Manager OR Programme Manager OR "
@@ -335,11 +335,21 @@ def verify_job_links(limit=30):
     return f"Checked {checked} links: {expired} now marked Closed/Expired, {errors} couldn't be verified this time."
 
 
-def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None):
+def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None, owner_label="app"):
     """Public entry point — wraps the real scan logic in a safety net so any
     unexpected exception (e.g. a locked database file) still resets
     scan_state, instead of leaving the progress bar and Stop button frozen
-    forever with no error shown."""
+    forever with no error shown. Also enforces a scan lock so two scans
+    (e.g. a scheduled GitHub Actions run and a manual 'Recheck Now') can
+    never run at the same time."""
+    if not try_acquire_scan_lock(owner_label=owner_label):
+        is_locked, owner, held_since = get_scan_lock_status()
+        msg = f"Another scan is already in progress (started by '{owner}' at {held_since}). Try again shortly."
+        if scan_state is not None:
+            scan_state["running"] = False
+            scan_state["message"] = msg
+        return msg
+
     try:
         return _run_scan_impl(
             limit=limit, mode=mode, scan_state=scan_state,
@@ -350,6 +360,8 @@ def run_scan(limit=20, mode="next_batch", scan_state=None, stop_event=None, sing
             scan_state["running"] = False
             scan_state["message"] = f"Scan crashed unexpectedly: {e}"
         return f"Scan crashed unexpectedly: {e}"
+    finally:
+        release_scan_lock()
 
 
 def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None, single_company=None):
@@ -366,7 +378,7 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
     cursor.execute("UPDATE jobs SET job_status = 'Old' WHERE job_status = 'New'")
     conn.commit()
 
-    cursor.execute("SELECT id, filename FROM cv_versions WHERE is_active = TRUE")
+    cursor.execute("SELECT id, filename, file_content FROM cv_versions WHERE is_active = TRUE")
     active_cv = cursor.fetchone()
     if not active_cv:
         conn.close()
@@ -375,12 +387,12 @@ def _run_scan_impl(limit=20, mode="next_batch", scan_state=None, stop_event=None
             scan_state["running"] = False
             scan_state["message"] = msg
         return msg
-    cv_id, cv_filename = active_cv
+    cv_id, cv_filename, cv_bytes = active_cv
 
-    cv_text = load_cv(cv_filename)
+    cv_text = load_cv_from_bytes(bytes(cv_bytes) if cv_bytes is not None else None, cv_filename)
     if not cv_text:
         conn.close()
-        msg = f"ERROR: Active CV file '{cv_filename}' could not be read (missing, moved, or corrupted). Scan aborted before wasting AI calls."
+        msg = f"ERROR: Active CV '{cv_filename}' could not be read from the database (empty or corrupted). Please re-upload it. Scan aborted before wasting AI calls."
         if scan_state is not None:
             scan_state["running"] = False
             scan_state["message"] = msg

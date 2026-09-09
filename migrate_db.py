@@ -111,6 +111,12 @@ def migrate():
     else:
         print("'last_verified_date' column already present. Nothing to do.")
 
+    if not column_exists(cursor, "cv_versions", "file_content"):
+        print("Adding 'file_content' column so CVs are stored in the database, not local disk...")
+        cursor.execute("ALTER TABLE cv_versions ADD COLUMN file_content BLOB")
+    else:
+        print("'file_content' column already present. Nothing to do.")
+
     conn.commit()
     conn.close()
     print("Migration complete.")

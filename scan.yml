@@ -1,0 +1,50 @@
+name: Job Search OS Scan
+
+on:
+  # Manual trigger from the GitHub Actions tab - lets you pick mode/limit
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan mode"
+        required: true
+        default: "next_batch"
+        type: choice
+        options:
+          - next_batch
+          - retry_errors
+          - new_run
+          - freshness_check
+      limit:
+        description: "Max companies to process"
+        required: true
+        default: "20"
+
+  # Scheduled run - adjust the cron expression to whatever cadence you want.
+  # This example runs every 6 hours. Cron is in UTC.
+  schedule:
+    - cron: "0 */6 * * *"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python run_scan_job.py \
+            --mode "${{ github.event.inputs.mode || 'next_batch' }}" \
+            --limit "${{ github.event.inputs.limit || '20' }}"

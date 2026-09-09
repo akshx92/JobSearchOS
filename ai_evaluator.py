@@ -1,4 +1,5 @@
 import os
+import io
 import glob
 import json
 import re
@@ -16,11 +17,33 @@ client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 MODEL_NAME = "gemini-3.6-flash"
 
 
+def load_cv_from_bytes(file_bytes, filename=""):
+    """Primary CV loading path: extracts text from raw file bytes fetched
+    from the database (cv_versions.file_content). This is what makes the CV
+    survive reboots/redeploys — it's stored in Postgres, not on local disk,
+    which is wiped every time the app container restarts."""
+    if not file_bytes:
+        return None
+    name_lower = (filename or "").lower()
+    try:
+        if name_lower.endswith(".txt"):
+            return file_bytes.decode("utf-8", errors="ignore")
+        # Default to PDF parsing (also covers unknown/missing extensions,
+        # since PDF is the only upload type the UI currently accepts).
+        reader = PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in reader.pages:
+            text += (page.extract_text() or "") + "\n"
+        return text if text.strip() else None
+    except Exception:
+        return None
+
+
 def load_cv(cv_path=None):
     """
-    Loads CV text. If cv_path is given (the active CV's filename from the
-    cv_versions table), reads that file directly. Otherwise falls back to
-    glob-searching the project root (legacy behavior).
+    Legacy file-path-based loader, kept for local development/testing only.
+    Production scans should use load_cv_from_bytes() instead, since local
+    files don't survive cloud reboots/redeploys.
     """
     if cv_path and os.path.isfile(cv_path):
         return _read_cv_file(cv_path)

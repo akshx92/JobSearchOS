@@ -15,7 +15,8 @@ def setup_tracking_tables():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         filename TEXT NOT NULL,
         uploaded_date TEXT NOT NULL,
-        is_active BOOLEAN DEFAULT 0
+        is_active BOOLEAN DEFAULT 0,
+        file_content BLOB
     )
     ''')
 
