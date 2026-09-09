@@ -1,0 +1,56 @@
+name: Job Search OS Scan
+
+on:
+  # Manual trigger from the GitHub Actions tab - lets you override for a one-off run
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Scan mode ('auto' clears pending backlog, then switches to freshness_check once empty)"
+        required: true
+        default: "auto"
+        type: choice
+        options:
+          - auto
+          - next_batch
+          - retry_errors
+          - new_run
+          - freshness_check
+      limit:
+        description: "Max companies to process (ignored in auto mode)"
+        required: false
+        default: "20"
+
+  # Runs once daily at 5:00 AM IST (India Standard Time = UTC+5:30).
+  # Cron is always in UTC, so 5:00 AM IST = 11:30 PM UTC the previous day.
+  schedule:
+    - cron: "30 23 * * *"
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    # 340 minutes gives the scan room to clear a large backlog in one run,
+    # while staying under GitHub's 360-minute hard limit per job. The scan
+    # itself also stops gracefully at 330 minutes (see run_scan_job.py),
+    # leaving a buffer for this timeout to never actually be hit.
+    timeout-minutes: 340
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scan
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python run_scan_job.py \
+            --mode "${{ github.event.inputs.mode || 'auto' }}" \
+            --limit "${{ github.event.inputs.limit || '20' }}" \
+            --max-minutes 330
